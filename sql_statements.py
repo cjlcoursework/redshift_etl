@@ -60,8 +60,8 @@ time_table_drop = f"drop table if exists {DIM_TIME_TABLE}"
 # CREATE TABLES
 songplay_table_create = (f"""
 create table {FACT_SONGPLAY_TABLE} (
-    songplay_id bigint identity(1, 1) PRIMARY KEY,
-    time_id varchar(60),
+    songplay_id bigint identity(1, 1) PRIMARY KEY distkey,
+    time_id varchar(60) sortkey,
     start_ts timestamp,
     user_id int , 
     level text  , 
@@ -75,42 +75,41 @@ create table {FACT_SONGPLAY_TABLE} (
 user_table_create = (f"""
 create table {DIM_USER_TABLE}
 (
-    user_id    int PRIMARY KEY ,
+    user_id    int PRIMARY KEY sortkey,
     first_name text,
     last_name  text,
     gender     varchar(2)  ,  
     level      text  
-)""")
+) diststyle all""")
 
 song_table_create = (f"""
 create table {DIM_SONG_TABLE} (
-    song_id  varchar(60)  PRIMARY KEY  ,
+    song_id  varchar(60)  PRIMARY KEY  distkey,
     title text  ,
     artist_id text  ,
     year int  ,
-    duration numeric  )
+    duration numeric  )  
 """)
 
 artist_table_create = (f"""
 create table {DIM_ARTIST_TABLE} (
-    artist_id  varchar(60)  PRIMARY KEY  ,
+    artist_id  varchar(60)  PRIMARY KEY  distkey,
     name text  ,
     location text  ,
     latitude double precision,
-    longitude  double precision)
-;
+    longitude  double precision) 
 """)
 
 time_table_create = (f"""
 create table {DIM_TIME_TABLE} (
-    time_id varchar(60),
+    time_id varchar(60) sortkey,
     hour int  , 
     day int , 
     week int , 
     month int , 
     year int , 
     weekday boolean  
-)
+)  diststyle all
 """)
 
 # BUILD STAR INSERTS

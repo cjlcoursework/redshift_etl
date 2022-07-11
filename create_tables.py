@@ -91,8 +91,8 @@ def wait_cluster_status(configs: configparser.ConfigParser, desired_status: Clus
 
     """
     while check_cluster_available(configs)[0] != desired_status:
-        print("waiting 10 sec for cluster....")
-        time.sleep(10)
+        print("waiting 30 sec for cluster....")
+        time.sleep(30)
 
 
 def sg_open_port(my_cluster_props: dict, configs: configparser.ConfigParser):
