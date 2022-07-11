@@ -2,26 +2,26 @@
 
 import configparser
 import json
-import logging
-import os
 import time
 from enum import Enum
 
 import boto3
-import pandas as pd
 import redshift_connector
-from botocore.exceptions import ClientError
+from redshift_connector.core import Connection, Cursor
 
 from sql_statements import *
 
 
+# Enum to designate the status of the Redshift cluster
 class ClusterStatus(Enum):
     NO_CLUSTER = 1
     UNAVAILABLE = 2
     AVAILABLE = 3
+    DELETING = 4
+    CREATING = 5
 
 
-# don't use access keys - use local aws environment instead
+# Don't use access keys - just configure local .aws environment instead
 ec2 = boto3.resource('ec2',
                      region_name="us-west-2"
                      )
@@ -39,19 +39,21 @@ redshift = boto3.client('redshift',
                         )
 
 
-def pretty_print_props(props):
-    print("==========")
-    pd.set_option('display.max_colwidth', 25)
-    keysToShow = ["ClusterIdentifier", "NodeType", "ClusterStatus", "MasterUsername", "DBName", "Endpoint",
-                  "NumberOfNodes", 'VpcId']
-    x = [(k, v) for k, v in props.items() if k in keysToShow]
-    return pd.DataFrame(data=x, columns=["Key", "Value"])
+# Utility routines
 
 
-def check_cluster_available(configs):
+def check_cluster_available(configs: configparser.ConfigParser) -> (ClusterStatus, dict):
+    """
+    Describe the Redshift cluster and return
+    TODO - handle scenarios where the cluster is being created, deleted, or otherwise unavailable
+
+    :param configs: configurations
+    :return: The ClusterStatus and the properties returned from redshift.describe_clusters()
+    """
     cluster_name = configs.get("DWH", "DWH_CLUSTER_IDENTIFIER")
     try:
         my_cluster_props = redshift.describe_clusters(ClusterIdentifier=cluster_name)['Clusters'][0]
+
     except Exception as e:
         return ClusterStatus.NO_CLUSTER, None
 
@@ -59,77 +61,84 @@ def check_cluster_available(configs):
     cluster_status = ClusterStatus.UNAVAILABLE
     if 'ClusterStatus' in my_cluster_props:
         cluster_status_str = my_cluster_props['ClusterStatus']
+
+        if cluster_status_str == 'deleting':
+            print(f"Cluster {cluster_name} is being deleted ...")
+            exit(0)
+
         if cluster_status_str == 'available':
-            print(f"Cluster {cluster_name} is ready ...")
+            print(f"Cluster {cluster_name} is up ...")
             cluster_status = ClusterStatus.AVAILABLE
 
+        elif cluster_status_str == 'creating':
+            print(f"Cluster {cluster_name} is being created ...")
+            cluster_status = ClusterStatus.CREATING
+
     if cluster_status == ClusterStatus.AVAILABLE:
-        configs.set("DWH", "DWH_ENDPOINT", my_cluster_props['Endpoint']['Address'] )
+        configs.set("DWH", "DWH_ENDPOINT", my_cluster_props['Endpoint']['Address'])
         configs.set("IAM", "ARN", my_cluster_props['IamRoles'][0]['IamRoleArn'])
         return ClusterStatus.AVAILABLE, my_cluster_props
 
     return ClusterStatus.UNAVAILABLE, my_cluster_props
 
 
-def wait_cluster_status(configs):
-    while check_cluster_available(configs)[0] != ClusterStatus.AVAILABLE:
-        print("waiting for cluster....")
-        time.sleep(5)
+def wait_cluster_status(configs: configparser.ConfigParser, desired_status: ClusterStatus = ClusterStatus.AVAILABLE):
+    """
+    Poll for the availability of the Redshift cluster
+
+    :param desired_status: what status are we waiting for?
+    :param configs: configurations
+
+    """
+    while check_cluster_available(configs)[0] != desired_status:
+        print("waiting 10 sec for cluster....")
+        time.sleep(10)
 
 
-def redshift_cluster_up(configs):
-    cluster_status, props = check_cluster_available(configs)
-    iam_role = configs.get("IAM", "ARN")
-    if cluster_status == ClusterStatus.NO_CLUSTER:
-        try:
-            # Create Cluster
-            response = redshift.create_cluster(
-                # HW
-                ClusterType=configs.get("DWH","DWH_CLUSTER_TYPE"),
-                NodeType=configs.get("DWH","DWH_NODE_TYPE"),
-                NumberOfNodes=int(configs.get("DWH","DWH_NUM_NODES")),
+def sg_open_port(my_cluster_props: dict, configs: configparser.ConfigParser):
+    """
+    Open the VPC security group to allow public access to Redshift
 
-                # Identifiers & Credentials
-                DBName=configs.get("DWH","DWH_DB"),
-                ClusterIdentifier=configs.get("DWH","DWH_CLUSTER_IDENTIFIER"),
-                MasterUsername=configs.get("DWH","DWH_DB_USER"),
-                MasterUserPassword=configs.get("DWH","DWH_DB_PASSWORD"),
-
-                # Roles (for s3 access)
-                IamRoles=[iam_role]
-            )
-
-            # Open port on default security group
-            open_sg_port(props, configs)
-
-            # Refresh properties
-            cluster_status, props = check_cluster_available(configs)
-
-        except Exception as e:
-            print(e)
-
-    if cluster_status != ClusterStatus.AVAILABLE:
-        wait_cluster_status(configs)
-
-    if cluster_status == ClusterStatus.AVAILABLE:
-        configs.set("DWH", "DWH_ENDPOINT", props['Endpoint']['Address'])
-        configs.set("IAM", "ARN", props['IamRoles'][0]['IamRoleArn'])
-
-    return cluster_status, props
+    :param my_cluster_props: Redshift cluster properties
+    :param configs: configurations for this application
+    """
+    try:
+        vpc = ec2.Vpc(id=my_cluster_props['VpcId'])
+        redshift_port = configs.get("DWH", "DWH_PORT")
+        default_sg = list(vpc.security_groups.all())[0]
+        print(default_sg)
+        default_sg.authorize_ingress(
+            GroupName=default_sg.group_name,
+            CidrIp='0.0.0.0/0',
+            IpProtocol='TCP',
+            FromPort=int(redshift_port),
+            ToPort=int(redshift_port)
+        )
+    except Exception as e:
+        pass
 
 
-def redshift_cluster_down(configs):
-    available, props = check_cluster_available(configs)
-    if available == ClusterStatus.AVAILABLE:
-        print("Bring cluster down....")
-        cluster_name = configs.get("DWH", "DWH_CLUSTER_IDENTIFIER")
-        role_name = configs.get("DWH","DWH_IAM_ROLE_NAME")
-        redshift.delete_cluster(ClusterIdentifier=cluster_name, SkipFinalClusterSnapshot=True)
-        iam.detach_role_policy(RoleName=role_name, PolicyArn="arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess")
-        iam.delete_role(RoleName=role_name)
+def get_configs() -> configparser.ConfigParser:
+    """
+    Read the dwh.cfg file a load all into a configparser.ConfigParser object
+    :return: the configurations object
+    """
+    config = configparser.ConfigParser()
+    config.read_file(open('dwh.cfg'))
+    config.set("DWH", "ROLE_ARN", "")
+    return config
 
 
-def create_role_arn(configs):
+# Main routines
+
+def create_role_arn(configs: configparser.ConfigParser) -> str:
+    """
+    Create a service role to allow Redshift access to S3
+
+    :param configs: configurations
+
+    return: Arn name
+    """
     dwh_iam_role_name = configs.get("DWH", "DWH_IAM_ROLE_NAME")
     existing_arn = None
     try:
@@ -170,30 +179,75 @@ def create_role_arn(configs):
     return role_arn
 
 
-def get_configs():
-    config = configparser.ConfigParser()
-    config.read_file(open('dwh.cfg'))
-    config.set("DWH", "ROLE_ARN", "")
-    return config
+def redshift_cluster_up(configs: configparser.ConfigParser) -> (ClusterStatus, dict):
+    """
+    Create a Redshift cluster based on the parameters in the provided configuration (configs)
+
+    :param configs: configurations
+    """
+    cluster_status, props = check_cluster_available(configs)
+    iam_role = configs.get("IAM", "ARN")
+    if cluster_status == ClusterStatus.NO_CLUSTER:
+        try:
+            # Create Cluster
+            response = redshift.create_cluster(
+                # HW
+                ClusterType=configs.get("DWH", "DWH_CLUSTER_TYPE"),
+                NodeType=configs.get("DWH", "DWH_NODE_TYPE"),
+                NumberOfNodes=int(configs.get("DWH", "DWH_NUM_NODES")),
+
+                # Identifiers & Credentials
+                DBName=configs.get("DWH", "DWH_DB"),
+                ClusterIdentifier=configs.get("DWH", "DWH_CLUSTER_IDENTIFIER"),
+                MasterUsername=configs.get("DWH", "DWH_DB_USER"),
+                MasterUserPassword=configs.get("DWH", "DWH_DB_PASSWORD"),
+
+                # Roles (for s3 access)
+                IamRoles=[iam_role]
+            )
+
+            # Refresh properties
+            cluster_status, props = check_cluster_available(configs)
+
+            # Open port on default security group
+            sg_open_port(props, configs)
+
+        except Exception as e:
+            print(e)
+
+    if cluster_status != ClusterStatus.AVAILABLE:
+        wait_cluster_status(configs)
+
+    if cluster_status == ClusterStatus.AVAILABLE:
+        configs.set("DWH", "DWH_ENDPOINT", props['Endpoint']['Address'])
+        configs.set("IAM", "ARN", props['IamRoles'][0]['IamRoleArn'])
+
+    return cluster_status, props
 
 
-def open_sg_port(my_cluster_props, configs):
-    try:
-        vpc = ec2.Vpc(id=my_cluster_props['VpcId'])
-        defaultSg = list(vpc.security_groups.all())[0]
-        print(defaultSg)
-        defaultSg.authorize_ingress(
-            GroupName=defaultSg.group_name,
-            CidrIp='0.0.0.0/0',
-            IpProtocol='TCP',
-            FromPort=int(configs["DWH_PORT"]),
-            ToPort=int(configs["DWH_PORT"])
-        )
-    except Exception as e:
-        print(e)
+def redshift_cluster_down(configs: configparser.ConfigParser):
+    """
+    Delete the Redshift cluster if it exists and the attached s3 role
+
+    :param configs: configuration data
+    """
+    available, props = check_cluster_available(configs)
+    if available == ClusterStatus.AVAILABLE:
+        print("Bring cluster down....")
+        cluster_name = configs.get("DWH", "DWH_CLUSTER_IDENTIFIER")
+        role_name = configs.get("DWH", "DWH_IAM_ROLE_NAME")
+        redshift.delete_cluster(ClusterIdentifier=cluster_name, SkipFinalClusterSnapshot=True)
+        iam.detach_role_policy(RoleName=role_name, PolicyArn="arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess")
+        iam.delete_role(RoleName=role_name)
 
 
-def connect_redshift(configs):
+def connect_redshift(configs: configparser.ConfigParser) -> Connection:
+    """
+    Connect to Redshift
+
+    :param configs: configuration object
+    :return: the live Connection
+    """
     db_user = configs.get("DWH", "DWH_DB_USER")
     db_password = configs.get("DWH", "DWH_DB_PASSWORD")
     endpoint = configs.get("DWH", "DWH_ENDPOINT")
@@ -209,28 +263,53 @@ def connect_redshift(configs):
     return conn
 
 
-def drop_tables(conn, cur):
-    print("drop tables ...")
-    for query in drop_table_queries:
-        cur.execute(query)
-        conn.commit()
+def create_schemas(conn: Connection):
+    """
+    Create stage and data schemas if they do not exist
 
-
-def create_tables(cur, conn):
-    print("create tables ...")
-    for query in create_table_queries:
-        cur.execute(query)
-        conn.commit()
-
-
-def create_schemas(conn) :
+    :param conn:
+    :return:
+    """
     cur = conn.cursor()
     cur.execute(f"create schema if not exists {STAGING_SCHEMA}")
     cur.execute(f"create schema if not exists {DHW_SCHEMA}")
     conn.commit()
 
 
-def init_database():
+def drop_tables(conn: Connection, cur: Cursor):
+    """
+    Drop all tables using the sql in the global drop_table_queries variable
+
+    :param conn: Redshift connection
+    :param cur: Redshift cursor
+    """
+    print("drop tables ...")
+    for query in drop_table_queries:
+        cur.execute(query)
+        conn.commit()
+
+
+def create_tables(cur: Cursor, conn: Connection):
+    """
+    Create all tables using the sql in the global create_table_queries variable
+
+    :param conn: Redshift connection
+    :param cur: Redshift cursor
+    """
+    print("create tables ...")
+    for query in create_table_queries:
+        cur.execute(query)
+        conn.commit()
+
+
+def init_database() -> (Connection, configparser.ConfigParser):
+    """
+    Main entry point for creating the Redshift cluster, the database and stag and data schemas
+
+    :return:
+        - The redshift_connection.Connection
+        - A configuration object of type configparser.ConfigParser
+    """
     # get configs
     config = get_configs()
 
@@ -251,4 +330,3 @@ def init_database():
     create_tables(cur=cursor, conn=conn)
 
     return conn, config
-

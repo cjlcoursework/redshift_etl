@@ -1,6 +1,14 @@
+from redshift_connector import Connection
+
 from sql_statements import *
 
 QUERIES = [
+    f"select count(*) from {FACT_SONGPLAY_TABLE} limit 5",
+    f"select count(*)  from {DIM_USER_TABLE} limit 5",
+    f"select count(*)  from {DIM_SONG_TABLE} limit 5",
+    f"select count(*)  from {DIM_ARTIST_TABLE} limit 5",
+    f"select count(*)  from {DIM_TIME_TABLE} limit 5",
+
     f"select * from {FACT_SONGPLAY_TABLE} limit 5",
     f"select * from {DIM_USER_TABLE} limit 5",
     f"select * from {DIM_SONG_TABLE} limit 5",
@@ -17,7 +25,13 @@ QUERIES = [
 ]
 
 
-def perform_queries(conn):
+def perform_queries(conn: Connection):
+    """
+    Perform all queries in the global List "QUERIES"
+
+    :param conn: A live Redshift connection
+    :return:
+    """
     cur = conn.cursor()
     print("\nquery tables ...")
     for query in QUERIES:
